@@ -20,6 +20,7 @@ while True:
 
 import gym
 import numpy as np
+import copy
 
 from stable_baselines.common.policies import MlpPolicy
 from stable_baselines.common.vec_env import DummyVecEnv
@@ -33,16 +34,29 @@ from collections import OrderedDict
 import numpy as np
 
 from stable_baselines.common.vec_env import VecEnv
-from stable_baselines.common.vec_env.util import copy_obs_dict, dict_to_obs, obs_space_info
+from stable_baselines.common.vec_env.util import (
+    copy_obs_dict,
+    dict_to_obs,
+    obs_space_info,
+)
 
 scenario_name = "simple_tag"
 num_adversaries = 5
+
+
+def to_categorical(action, shape=5):
+    if type(action) is list:
+        action = action[0]
+    z = np.zeros(shape)
+    z[action] = 1
+    return z
+
 
 class SingleAgentEnv(gym.Env):
     def __init__(self, observation_space, action_space):
         self.observation_space = observation_space
         self.action_space = action_space
-    
+
     def step(self):
         return self
 
@@ -54,8 +68,12 @@ def env_splitter(multi_env):
     """
     Takes in multiagentenv, and spits out each env individually?
     """
-    return [SingleAgentEnv(obs_space, act_space) for obs_space, act_space in zip(multi_env.observation_space, multi_env.action_space)]
-
+    return [
+        SingleAgentEnv(obs_space, act_space)
+        for obs_space, act_space in zip(
+            multi_env.observation_space, multi_env.action_space
+        )
+    ]
 
 
 class MultiRunner(object):
@@ -63,7 +81,7 @@ class MultiRunner(object):
         """
         A runner to learn the policy of an environment for a model
         :param env: (Gym environment) The environment to learn from
-        :param model: (Model) The model to learn
+        :param model: (list[Model]) The model to learn
         :param n_steps: (int) The number of steps to run for each environment
         :param gamma: (float) Discount factor
         :param lam: (float) Factor for trade-off of bias vs variance for Generalized Advantage Estimator
@@ -74,26 +92,31 @@ class MultiRunner(object):
         # super().__init__(env=env, model=models, n_steps=n_steps)
         self.env = env
         self.model = model
-        n_env = 0 # env.num_envs
+        n_env = 1  # env.num_envs
 
         self.batch_ob_shape = []
         self.obs = []
         for idx, env_observation_space in enumerate(env.observation_space):
-            self.batch_ob_shape.append((n_env*n_steps,) + env.observation_space.shape)
-            self.obs.append(np.zeros((n_env,) + env.observation_space.shape, dtype=env.observation_space.dtype.name))
+            self.batch_ob_shape.append((n_env * n_steps,) + env.observation_space.shape)
+            self.obs.append(
+                np.zeros(
+                    (n_env,) + env.observation_space.shape,
+                    dtype=env.observation_space.dtype.name,
+                )
+            )
 
         obs_reset = env.reset()
         for idx, x in enumerate(obs_reset):
             self.obs[idx][:] = x
         self.n_steps = n_steps
-        self.states = [x.initial_state for x in self.model] # get states...
+        self.states = [x.initial_state for x in self.model]  # get states...
         self.dones = [False for _ in range(n_env)]
 
     def run(self):
         """
         Run a learning step of the model
         :return:
-            - observations: (np.ndarray) the observations
+            - observations: (list[np.ndarray]) the observations
             - rewards: (np.ndarray) the rewards
             - masks: (numpy bool) whether an episode is over or not
             - actions: (np.ndarray) the actions
@@ -103,23 +126,48 @@ class MultiRunner(object):
             - infos: (dict) the extra information of the model
         """
         # mb stands for minibatch
-        mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = [], [], [], [], [], []
+        mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
         mb_states = self.states
         ep_infos = []
         for _ in range(self.n_steps):
-            actions, values, self.states, neglogpacs = self.model.step(self.obs, self.states, self.dones)
-            mb_obs.append(self.obs.copy())
+            actions = []
+            values = []
+            states = []
+            neglogpacs = []
+            for idx, agent in enumerate(self.model):
+                actions_, values_, states_, neglogpacs_ = self.model.step(
+                    self.obs[idx].reshape(1, -1), self.states[idx], self.dones
+                )
+                actions.append(actions_)
+                values.append(values_)
+                states.append(states_)
+                neglogpacs.append(neglogpacs_)
+            mb_obs.append(copy.copy(self.obs))
             mb_actions.append(actions)
             mb_values.append(values)
             mb_neglogpacs.append(neglogpacs)
             mb_dones.append(self.dones)
-            clipped_actions = actions
-            # Clip the actions to avoid out of bound error
-            if isinstance(self.env.action_space, gym.spaces.Box):
-                clipped_actions = np.clip(actions, self.env.action_space.low, self.env.action_space.high)
+            clipped_actions = copy.copy(actions)
+
+            # Clip the actions to avoid out of bound error - do this by agent
+            # we will skip this for now...
+            """
+            clipped_actions = []
+            for idx, agent in enumerate(self.model):
+                if isinstance(self.env.action_space, gym.spaces.Box):
+                    clipped_actions.append(np.clip(actions, self.env.action_space.low, self.env.action_space.high))
+            """
+
             self.obs[:], rewards, self.dones, infos = self.env.step(clipped_actions)
             for info in infos:
-                maybe_ep_info = info.get('episode')
+                maybe_ep_info = info.get("episode")
                 if maybe_ep_info is not None:
                     ep_infos.append(maybe_ep_info)
             mb_rewards.append(rewards)
@@ -142,14 +190,40 @@ class MultiRunner(object):
             else:
                 nextnonterminal = 1.0 - mb_dones[step + 1]
                 nextvalues = mb_values[step + 1]
-            delta = mb_rewards[step] + self.gamma * nextvalues * nextnonterminal - mb_values[step]
-            mb_advs[step] = last_gae_lam = delta + self.gamma * self.lam * nextnonterminal * last_gae_lam
+            delta = (
+                mb_rewards[step]
+                + self.gamma * nextvalues * nextnonterminal
+                - mb_values[step]
+            )
+            mb_advs[step] = last_gae_lam = (
+                delta + self.gamma * self.lam * nextnonterminal * last_gae_lam
+            )
         mb_returns = mb_advs + mb_values
 
-        mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, true_reward = \
-            map(swap_and_flatten, (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, true_reward))
+        mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, true_reward = map(
+            swap_and_flatten,
+            (
+                mb_obs,
+                mb_returns,
+                mb_dones,
+                mb_actions,
+                mb_values,
+                mb_neglogpacs,
+                true_reward,
+            ),
+        )
 
-        return mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, mb_states, ep_infos, true_reward
+        return (
+            mb_obs,
+            mb_returns,
+            mb_dones,
+            mb_actions,
+            mb_values,
+            mb_neglogpacs,
+            mb_states,
+            ep_infos,
+            true_reward,
+        )
 
 
 scenario = scenarios.load(scenario_name + ".py").Scenario()
@@ -160,8 +234,25 @@ env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.obser
 split_env = env_splitter(env)
 agents = [PPO2(MlpPolicy, DummyVecEnv([lambda: x]), verbose=1) for x in split_env]
 
+# based on these agents on the parent world we want to act and observe it.
+obs_reset = env.reset()
+states = [x.initial_state for x in agents]
+dones = [False for _ in range(1)]
+
+actions = []
+for idx in range(len(env.agents)):
+    action = agents[idx].step(obs_reset[idx].reshape(1, -1), states[idx], False)
+    actions.append(action[0][0])
+
+# see https://github.com/openai/multiagent-particle-envs/blob/master/multiagent/policy.py
+# for how to construct this...
+env.step(
+    [np.concatenate([to_categorical(x), np.zeros(env.world.dim_c)]) for x in actions]
+)
+
+
 obs_shape_n = [env.observation_space[i].shape for i in range(env.n)]
-num_adversaries = env.n # min(env.n, arglist.num_adversaries)
+num_adversaries = env.n  # min(env.n, arglist.num_adversaries)
 num_adversaries = 0
 
 # get the trainers to train using PPO
